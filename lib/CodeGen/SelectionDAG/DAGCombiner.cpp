@@ -5757,6 +5757,126 @@ SDValue DAGCombiner::visitBUILD_PAIR(SDNode *N) {
   return CombineConsecutiveLoads(N, VT);
 }
 
+/// isExactlyZeroOrOne - If it returns true, the SDValue is exactly zero (of
+/// either sign, for floating point values) or one; if it returns false then no
+/// conclusions should be drawn
+///
+/// Should also return true for a vector of values that are all exactly zero or
+/// one, but the case is currently only handled for SETCC nodes.
+static bool isExactlyZeroOrOne(const TargetLowering &TLI, const SDValue &Op) {
+  const SDValue *V = &Op;
+
+  while (true) {
+    if (V->getValueType() == MVT::i1)
+      return true;
+
+    if (ConstantSDNode *VC = dyn_cast<ConstantSDNode>(V->getNode()))
+      if (VC->isNullValue() || VC->isOne())
+        return true;
+
+    if (ConstantFPSDNode *VCFP = dyn_cast<ConstantFPSDNode>(V->getNode()))
+      if (VCFP->isZero() || VCFP->isExactlyValue(1.0))
+        return true;
+
+    switch (V->getOpcode()) {
+    default: break;
+    case ISD::SETCC:
+      return TLI.getBooleanContents(V->getValueType().isVector()) ==
+        TargetLowering::ZeroOrOneBooleanContent;
+    case ISD::FSUB:
+      if (ConstantFPSDNode *V0CFP =
+            dyn_cast<ConstantFPSDNode>(V->getOperand(0))) {
+        if (V0CFP->isExactlyValue(1.0)) {
+          V = &V->getOperand(1);
+          continue;
+        }
+      }
+      break;
+    case ISD::FADD:
+      if (ConstantFPSDNode *V0CFP =
+            dyn_cast<ConstantFPSDNode>(V->getOperand(0))) {
+        if (V0CFP->isZero()) {
+          V = &V->getOperand(1);
+          continue;
+        }
+      }
+      if (ConstantFPSDNode *V1CFP =
+            dyn_cast<ConstantFPSDNode>(V->getOperand(1))) {
+        if (V1CFP->isZero()) {
+          V = &V->getOperand(0);
+          continue;
+        }
+      }
+      break;
+    case ISD::FMUL:
+      if (ConstantFPSDNode *V0CFP =
+            dyn_cast<ConstantFPSDNode>(V->getOperand(0))) {
+        if (V0CFP->isZero())
+          return true;
+        if (V0CFP->isExactlyValue(1.0)) {
+          V = &V->getOperand(1);
+          continue;
+        }
+      }
+      if (ConstantFPSDNode *V1CFP =
+            dyn_cast<ConstantFPSDNode>(V->getOperand(1))) {
+        if (V1CFP->isZero())
+          return true;
+        if (V1CFP->isExactlyValue(1.0)) {
+          V = &V->getOperand(0);
+          continue;
+        }
+      }
+      break;
+    case ISD::OR:
+    case ISD::XOR:
+      if (ConstantSDNode *V0C = dyn_cast<ConstantSDNode>(V->getOperand(0))) {
+        if (V0C->isNullValue() || V0C->isOne()) {
+          V = &V->getOperand(1);
+          continue;
+        }
+      }
+      if (ConstantSDNode *V1C = dyn_cast<ConstantSDNode>(V->getOperand(1))) {
+        if (V1C->isNullValue() || V1C->isOne()) {
+          V = &V->getOperand(0);
+          continue;
+        }
+      }
+      break;
+    case ISD::AND:
+      if (ConstantSDNode *V0C = dyn_cast<ConstantSDNode>(V->getOperand(0))) {
+        if (V0C->isNullValue() || V0C->isOne())
+          return true;
+      }
+      if (ConstantSDNode *V1C = dyn_cast<ConstantSDNode>(V->getOperand(1))) {
+        if (V1C->isNullValue() || V1C->isOne())
+          return true;
+      }
+      break;
+    case ISD::UINT_TO_FP:
+    case ISD::SINT_TO_FP:
+    case ISD::FP_TO_SINT:
+    case ISD::FP_TO_UINT:
+    case ISD::FP_ROUND:
+    case ISD::FP_EXTEND:
+    case ISD::FABS:
+    case ISD::FCEIL:
+    case ISD::FFLOOR:
+    case ISD::FTRUNC:
+    case ISD::FRINT:
+    case ISD::FNEARBYINT:
+    case ISD::ZERO_EXTEND:
+    case ISD::SIGN_EXTEND:
+    case ISD::ANY_EXTEND:
+    case ISD::TRUNCATE:
+      V = &V->getOperand(0);
+      continue;
+    }
+
+    return false;
+  }
+}
+
 /// ConstantFoldBITCASTofBUILD_VECTOR - We know that BV is a build_vector
 /// node with Constant, ConstantFP or Undef operands.  DstEltVT indicates the
 /// destination element value type.
@@ -6082,19 +6202,26 @@ SDValue DAGCombiner::visitFADD(SDNode *N) {
   }
 
   // FADD -> FMA combines:
-  if ((DAG.getTarget().Options.AllowFPOpFusion == FPOpFusion::Fast ||
-       DAG.getTarget().Options.UnsafeFPMath) &&
-      DAG.getTarget().getTargetLowering()->isFMAFasterThanFMulAndFAdd(VT) &&
+  if (DAG.getTarget().getTargetLowering()->isFMAFasterThanFMulAndFAdd(VT) &&
       (!LegalOperations || TLI.isOperationLegalOrCustom(ISD::FMA, VT))) {
+    // FMA contraction is allowed either by target options or when either
+    // operand of the multiply has been promoted from i1 because in this case
+    // there is guaranteed to be no rounding error in the multiply step
+    bool AllowUnsafeFMA = DAG.getTarget().Options.UnsafeFPMath ||
+      DAG.getTarget().Options.AllowFPOpFusion == FPOpFusion::Fast;
 
     // fold (fadd (fmul x, y), z) -> (fma x, y, z)
-    if (N0.getOpcode() == ISD::FMUL && N0->hasOneUse())
+    if (N0.getOpcode() == ISD::FMUL && N0->hasOneUse() &&
+        (AllowUnsafeFMA || isExactlyZeroOrOne(TLI, N0.getOperand(0)) ||
+         isExactlyZeroOrOne(TLI, N0.getOperand(1))))
       return DAG.getNode(ISD::FMA, SDLoc(N), VT,
                          N0.getOperand(0), N0.getOperand(1), N1);
 
     // fold (fadd x, (fmul y, z)) -> (fma y, z, x)
     // Note: Commutes FADD operands.
-    if (N1.getOpcode() == ISD::FMUL && N1->hasOneUse())
+    if (N1.getOpcode() == ISD::FMUL && N1->hasOneUse() &&
+        (AllowUnsafeFMA || isExactlyZeroOrOne(TLI, N1.getOperand(0)) ||
+         isExactlyZeroOrOne(TLI, N1.getOperand(1))))
       return DAG.getNode(ISD::FMA, SDLoc(N), VT,
                          N1.getOperand(0), N1.getOperand(1), N0);
   }
@@ -6159,27 +6286,33 @@ SDValue DAGCombiner::visitFSUB(SDNode *N) {
   }
 
   // FSUB -> FMA combines:
-  if ((DAG.getTarget().Options.AllowFPOpFusion == FPOpFusion::Fast ||
-       DAG.getTarget().Options.UnsafeFPMath) &&
-      DAG.getTarget().getTargetLowering()->isFMAFasterThanFMulAndFAdd(VT) &&
-      (!LegalOperations || TLI.isOperationLegalOrCustom(ISD::FMA, VT))) {
+  if (DAG.getTarget().getTargetLowering()->isFMAFasterThanFMulAndFAdd(VT) &&
+       (!LegalOperations || TLI.isOperationLegalOrCustom(ISD::FMA, VT))) {
+    bool AllowUnsafeFMA = DAG.getTarget().Options.UnsafeFPMath ||
+      DAG.getTarget().Options.AllowFPOpFusion == FPOpFusion::Fast;
 
     // fold (fsub (fmul x, y), z) -> (fma x, y, (fneg z))
-    if (N0.getOpcode() == ISD::FMUL && N0->hasOneUse())
-      return DAG.getNode(ISD::FMA, dl, VT,
-                         N0.getOperand(0), N0.getOperand(1),
-                         DAG.getNode(ISD::FNEG, dl, VT, N1));
+    // Safe when x or y is promoted from i1 because a + b == a + (-b)
+    if (N0.getOpcode() == ISD::FMUL && N0->hasOneUse() &&
+        (AllowUnsafeFMA || isExactlyZeroOrOne(TLI, N0.getOperand(0)) ||
+         isExactlyZeroOrOne(TLI, N0.getOperand(1))))
+       return DAG.getNode(ISD::FMA, dl, VT,
+                          N0.getOperand(0), N0.getOperand(1),
+                          DAG.getNode(ISD::FNEG, dl, VT, N1));
 
     // fold (fsub x, (fmul y, z)) -> (fma (fneg y), z, x)
-    // Note: Commutes FSUB operands.
-    if (N1.getOpcode() == ISD::FMUL && N1->hasOneUse())
-      return DAG.getNode(ISD::FMA, dl, VT,
-                         DAG.getNode(ISD::FNEG, dl, VT,
-                         N1.getOperand(0)),
-                         N1.getOperand(1), N0);
+    // Note: Commutes FSUB operands. Not safe even if y or z is promoted from
+    // i1 due to distribution of the negative
+    if (AllowUnsafeFMA && N1.getOpcode() == ISD::FMUL && N1->hasOneUse())
+       return DAG.getNode(ISD::FMA, dl, VT,
+                          DAG.getNode(ISD::FNEG, dl, VT,
+                          N1.getOperand(0)),
+                          N1.getOperand(1), N0);
 
     // fold (fsub (fneg (fmul, x, y)), z) -> (fma (fneg x), y, (fneg z))
-    if (N0.getOpcode() == ISD::FNEG &&
+    // Not safe even if x or y is promoted from i1 due to distribution of the
+    // negative
+    if (AllowUnsafeFMA && N0.getOpcode() == ISD::FNEG &&
         N0.getOperand(0).getOpcode() == ISD::FMUL &&
         N0->hasOneUse() && N0.getOperand(0).hasOneUse()) {
       SDValue N00 = N0.getOperand(0).getOperand(0);
