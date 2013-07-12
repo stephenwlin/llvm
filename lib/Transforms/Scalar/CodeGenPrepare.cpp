@@ -16,6 +16,8 @@
 #define DEBUG_TYPE "codegenprepare"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/ValueMap.h"
@@ -116,6 +118,7 @@ namespace {
     }
 
   private:
+    bool ConvertSelectInstsToFMulInsts(Function &F);
     bool EliminateFallThrough(Function &F);
     bool EliminateMostlyEmptyBlocks(Function &F);
     bool CanMergeBlocks(const BasicBlock *BB, const BasicBlock *DestBB) const;
@@ -154,6 +157,10 @@ bool CodeGenPrepare::runOnFunction(Function &F) {
   PFI = getAnalysisIfAvailable<ProfileInfo>();
   OptSize = F.getAttributes().hasAttribute(AttributeSet::FunctionIndex,
                                            Attribute::OptimizeForSize);
+
+  // Convert certain selects to FMuls (possibly fused with FAdds to form
+  // FMulAdds) where possible and profitable
+  EverMadeChange |= ConvertSelectInstsToFMulInsts(F);
 
   /// This optimization identifies DIV instructions that can be
   /// profitably bypassed and carried out with a shorter, faster divide.
@@ -228,6 +235,359 @@ bool CodeGenPrepare::runOnFunction(Function &F) {
     DT->DT->recalculate(F);
 
   return EverMadeChange;
+}
+
+namespace {
+struct SelectUsageInfo {
+  bool HasWithoutInvert;
+  bool HasWithInvert;
+
+  typedef unsigned char CanFormFMulKind;
+  static const CanFormFMulKind InvertMask = 0x01;
+  static const CanFormFMulKind WithoutInvert = 0x00;
+  static const CanFormFMulKind WithInvert = 0x01;
+  SmallVector<SelectInst*, 4> CanFormFMulLocs;
+  SmallVector<CanFormFMulKind, 4> CanFormFMulKinds;
+
+  typedef unsigned char CanFormFMAKind;
+  static const CanFormFMAKind AddSubMask = 0x02;
+  static const CanFormFMAKind WithAdd = 0x00;
+  static const CanFormFMAKind WithSub = 0x02;
+  static const CanFormFMAKind CommuteMask = 0x04;
+  static const CanFormFMAKind WithoutCommute = 0x00;
+  static const CanFormFMAKind WithCommute = 0x04;
+  SmallVector<BinaryOperator*, 4> CanFormFMALocs;
+  SmallVector<CanFormFMAKind, 4> CanFormFMAKinds;
+
+  SelectUsageInfo() : HasWithoutInvert(false), HasWithInvert(false) { }
+};
+
+typedef MapVector<std::pair<Value*, Type*>, SelectUsageInfo>
+  SelectUsageInfoMap;
+typedef DenseSet<BinaryOperator*> FMALocSet;
+}
+
+static void SurveySelectForConversionToFMul(SelectInst *SI,
+                                            SelectUsageInfoMap &SUIM,
+                                            bool FMulFaster, bool FMAFaster,
+                                            FMALocSet SeenFMALocs) {
+  Value *BoolInt = SI->getCondition();
+  if (!isa<Argument>(BoolInt) && !isa<Instruction>(BoolInt))
+    return;
+
+  bool AllowUnsafe = SI->hasNoNaNs() && SI->hasNoInfs() &&
+                     SI->hasNoSignedZeros();
+
+  SelectUsageInfo::CanFormFMAKind Kind = 0;
+  ConstantFP *CFP;
+  SelectUsageInfo *SUI = 0;
+
+  if (((CFP = dyn_cast<ConstantFP>(SI->getFalseValue())) && CFP->isZero()) ||
+      isa<ConstantAggregateZero>(SI->getFalseValue())) {
+    // detect (select b f 0.0) which goes to (fmul f (uitofp b) )
+    Kind |= SelectUsageInfo::WithoutInvert;
+    SUI = &SUIM[std::make_pair(BoolInt, SI->getType())];
+    SUI->HasWithoutInvert = true;
+  } else if (((CFP = dyn_cast<ConstantFP>(SI->getTrueValue())) &&
+               CFP->isZero()) ||
+             isa<ConstantAggregateZero>(SI->getTrueValue())) {
+    // detect (select b 0.0 f) which goes to (fmul f (fsub 1.0 (uitofp b)))
+    Kind |= SelectUsageInfo::WithInvert;
+    SUI = &SUIM[std::make_pair(BoolInt, SI->getType())];
+    SUI->HasWithInvert = true;
+  } else
+    return;
+
+  if (FMAFaster) {
+    // detect possible FMA (i.e. if the new fmul would have one fadd or fsub as
+    // its only use)
+    BinaryOperator *BO;
+    if (SI->hasOneUse() &&
+        (BO = dyn_cast<BinaryOperator>(SI->use_back())) &&
+        (SeenFMALocs.find(BO) == SeenFMALocs.end())) {
+      if (BO->getOpcode() == Instruction::FAdd) {
+        if (AllowUnsafe ||
+            (BO->hasNoNaNs() && BO->hasNoInfs() && BO->hasNoSignedZeros())) {
+          if (BO->getOperand(0) == SI)
+            Kind |= (SelectUsageInfo::WithAdd |
+                     SelectUsageInfo::WithoutCommute);
+          else if (BO->getOperand(1) == SI)
+            Kind |= (SelectUsageInfo::WithAdd |
+                     SelectUsageInfo::WithCommute);
+          else
+            assert(false && "unexpected use of SelectInst by BinaryOperator");
+          SUI->CanFormFMALocs.push_back(BO);
+          SUI->CanFormFMAKinds.push_back(Kind);
+          SeenFMALocs.insert(BO);
+          return;
+        }
+      } else if (BO->getOpcode() == Instruction::FSub) {
+        if (AllowUnsafe ||
+            (BO->hasNoNaNs() && BO->hasNoInfs() && BO->hasNoSignedZeros())) {
+          if (BO->getOperand(0) == SI) {
+            Kind |= (SelectUsageInfo::WithSub |
+                     SelectUsageInfo::WithoutCommute);
+            SUI->CanFormFMALocs.push_back(BO);
+            SUI->CanFormFMAKinds.push_back(Kind);
+            SeenFMALocs.insert(BO);
+            return;
+          } else if (BO->getOperand(1) == SI) {
+            // Commuting the FSub requires unsafe algebra in addition to the
+            // other condtions
+            if (BO->hasUnsafeAlgebra()) {
+              Kind |= (SelectUsageInfo::WithSub |
+                       SelectUsageInfo::WithCommute);
+              SUI->CanFormFMALocs.push_back(BO);
+              SUI->CanFormFMAKinds.push_back(Kind);
+              SeenFMALocs.insert(BO);
+              return;
+            }
+          }
+          else
+            assert(false && "unexpected use of SelectInst by BinaryOperator");
+        }
+      }
+    }
+  }
+
+  // if no FMA was found, fall back to recording it as a possible FMul instead
+  if (AllowUnsafe && FMulFaster) {
+    SUI->CanFormFMulLocs.push_back(SI);
+    SUI->CanFormFMulKinds.push_back(Kind);
+  }
+}
+
+static bool FindExistingBoolToFloatCasts(Value *BoolInt, Type *FloatTy,
+                                         Value *NewBoolFP = 0,
+                                         Value *NewInvertBoolFP = 0) {
+  bool FoundExisting = false;
+  bool ReplaceWithNew = NewBoolFP || NewInvertBoolFP;
+  for (Value::use_iterator UI = BoolInt->use_begin(), UE = BoolInt->use_end();
+       UI != UE; ++UI) {
+    if (CastInst *CI = dyn_cast<CastInst>(*UI)) {
+      if (CI != NewBoolFP && CI->getType() == FloatTy &&
+          (CI->getOpcode() == Instruction::UIToFP ||
+           CI->getOpcode() == Instruction::SIToFP)) {
+        assert(CI->getOperand(0) == BoolInt &&
+               "unexpected use of value in UIToFP instruction");
+        FoundExisting = true;
+        if (NewInvertBoolFP) {
+          for (Value::use_iterator UI2 = CI->use_begin(), UE2 = CI->use_end();
+              UI2 != UE2; ++UI2) {
+            BinaryOperator *BO;
+            ConstantFP *CFP;
+            ConstantVector *CV;
+            if ((BO = dyn_cast<BinaryOperator>(*UI2)) &&
+                BO != NewInvertBoolFP &&
+                BO->getOpcode() == Instruction::FSub &&
+                (((CFP = dyn_cast<ConstantFP>(BO->getOperand(0))) &&
+                  CFP->isExactlyValue(1.0)) ||
+                 ((CV = dyn_cast<ConstantVector>(BO->getOperand(0))) &&
+                  (CFP = dyn_cast_or_null<ConstantFP>(CV->getSplatValue())) &&
+                  CFP->isExactlyValue(1.0)))) {
+              assert(BO->getType() == FloatTy && BO->getOperand(0) == CI &&
+                     "unexpected use of value in FSub instruction");
+              BO->replaceAllUsesWith(NewInvertBoolFP);
+              BO->eraseFromParent();
+            }
+          }
+        }
+        if (NewBoolFP) {
+          CI->replaceAllUsesWith(NewBoolFP);
+          CI->eraseFromParent();
+        }
+        if (!ReplaceWithNew)
+          return true;
+      }
+    } else if (BinaryOperator *BO = dyn_cast<BinaryOperator>(*UI)) {
+      ConstantInt *C;
+      ConstantVector *CV;
+      if (BO->getOpcode() == Instruction::Xor &&
+          (((C = dyn_cast<ConstantInt>(BO->getOperand(0))) &&
+            C->isOne()) ||
+           ((CV = dyn_cast<ConstantVector>(BO->getOperand(0))) &&
+            (C = dyn_cast_or_null<ConstantInt>(CV->getSplatValue())) &&
+            C->isOne()) ||
+           ((C = dyn_cast<ConstantInt>(BO->getOperand(1))) &&
+            C->isOne()) ||
+           ((CV = dyn_cast<ConstantVector>(BO->getOperand(1))) &&
+            (C = dyn_cast_or_null<ConstantInt>(CV->getSplatValue())) &&
+            C->isOne()))) {
+        assert((BO->getOperand(0) == BoolInt ||
+                BO->getOperand(1) == BoolInt) &&
+               "unexpected use of value in Xor instruction");
+        for (Value::use_iterator UI2 = BO->use_begin(), UE2 = BO->use_end();
+             UI2 != UE2; ++UI2) {
+          if (CastInst *CI = dyn_cast<CastInst>(*UI2)) {
+            if (CI != NewInvertBoolFP && CI->getType() == FloatTy &&
+                (CI->getOpcode() == Instruction::UIToFP ||
+                 CI->getOpcode() == Instruction::SIToFP)) {
+              assert(CI->getOperand(0) == BO &&
+                     "unexpected use of value in UIToFP instruction");
+              FoundExisting = true;
+              if (NewInvertBoolFP) {
+                CI->replaceAllUsesWith(NewInvertBoolFP);
+                CI->eraseFromParent();
+              }
+              if (!ReplaceWithNew)
+                return true;
+            }
+          }
+        }
+      }
+    }
+  }
+  return FoundExisting;
+}
+
+static void ReplaceWithFMul(IRBuilder<> &Builder, SelectInst *SI,
+                            SelectUsageInfo::CanFormFMulKind Kind,
+                            Instruction *BoolFP, Instruction *InvertBoolFP) {
+  Builder.SetInsertPoint(SI);
+  Value *FMulVal;
+  if ((Kind & SelectUsageInfo::InvertMask) ==
+      SelectUsageInfo::WithInvert)
+    // (select b 0.0 f) -> (fmul f (fsub 1.0 (uitofp b)))
+    FMulVal = Builder.CreateFMul(SI->getFalseValue(), InvertBoolFP);
+  else
+    // (select b f 0.0) -> (fmul f (uitofp b) )
+    FMulVal = Builder.CreateFMul(SI->getTrueValue(), BoolFP);
+  cast<Instruction>(FMulVal)->copyFastMathFlags(SI);
+  SI->replaceAllUsesWith(FMulVal);
+  SI->eraseFromParent();
+}
+
+static void ReplaceWithFMA(Module *M, IRBuilder<> &Builder,
+                           BinaryOperator *BO,
+                           SelectUsageInfo::CanFormFMAKind Kind,
+                           Instruction *BoolFP, Instruction *InvertBoolFP) {
+  Value *Op1Val, *Op2Val, *Op3Val;
+  SelectInst *SI;
+  if ((Kind & SelectUsageInfo::CommuteMask) == SelectUsageInfo::WithCommute) {
+    SI = cast<SelectInst>(BO->getOperand(1));
+    Op3Val = BO->getOperand(0);
+  } else {
+    SI = cast<SelectInst>(BO->getOperand(0));
+    Op3Val = BO->getOperand(1);
+  }
+  if ((Kind & SelectUsageInfo::InvertMask) == SelectUsageInfo::WithInvert) {
+    // (fadd (select b 0.0 f1) f2) -> (fma f1 (fsub 1.0 (uitofp b))) f2)
+    //   or
+    // (fadd f2 (select b 0.0 f1)) -> (fma f1 (fsub 1.0 (uitofp b))) f2)
+    Op1Val = SI->getFalseValue();
+    Op2Val = InvertBoolFP;
+  } else {
+    // (fadd (select b f1 0.0) f2) -> (fma f1 (uitofp b)) f2)
+    //   or
+    // (fadd f2 (select b f1 0.0)) -> (fma f1 (uitofp b)) f2)
+    Op1Val = SI->getTrueValue();
+    Op2Val = BoolFP;
+  }
+  Builder.SetInsertPoint(BO);
+  if ((Kind & SelectUsageInfo::AddSubMask) == SelectUsageInfo::WithSub) {
+    if ((Kind & SelectUsageInfo::CommuteMask) == SelectUsageInfo::WithCommute)
+      // (fsub f2 (select b f1 0.0)) -> (fma f1 (fneg (uitofp b)) f2)
+      Op2Val = Builder.CreateFNeg(Op2Val);
+    else
+      // (fsub (select b f1 0.0) f2) -> (fma f1 (uitofp b)) (fneg f2))
+      Op3Val = Builder.CreateFNeg(Op3Val);
+  }
+  Value *F = Intrinsic::getDeclaration(M, llvm::Intrinsic::fma, BO->getType());
+  Value *FMAVal = Builder.CreateCall3(F, Op1Val, Op2Val, Op3Val);
+  BO->replaceAllUsesWith(FMAVal);
+  BO->eraseFromParent();
+  assert(SI->use_empty() && "Unexpected remaining use of select");
+  SI->eraseFromParent();
+}
+
+bool CodeGenPrepare::ConvertSelectInstsToFMulInsts(Function &F) {
+  if (!TLI)
+    return false;
+
+  bool Changed = false;
+  SelectUsageInfoMap SUIM;
+  FMALocSet SeenFMALocs;
+  for (Function::iterator BI = F.begin(), BE = F.end(); BI != BE; ) {
+    BasicBlock *BB = BI++;
+    for (BasicBlock::iterator II = BB->begin(), IE = BB->end(); II != IE; ) {
+      Instruction *I = II++;
+      if (SelectInst *SI = dyn_cast<SelectInst>(I)) {
+        Type *SelectTy = SI->getType();
+        Type *CondTy = SI->getCondition()->getType();
+        if (SelectTy->isFloatingPointTy() ||
+            (SelectTy->isVectorTy() && CondTy->isVectorTy() &&
+             SelectTy->getScalarType()->isFloatingPointTy())) {
+          EVT VT = TLI->getValueType(SelectTy);
+          bool FMulFaster = TLI->isFMulFasterThanSelect(VT);
+          bool FMAFaster = TLI->isFMAFasterThanSelectAndFAdd(VT);
+          if (FMulFaster || FMAFaster)
+            SurveySelectForConversionToFMul(SI, SUIM, FMulFaster, FMAFaster,
+                                            SeenFMALocs);
+        }
+      }
+    }
+  }
+
+  for (SelectUsageInfoMap::iterator MI = SUIM.begin(), ME = SUIM.end();
+       MI != ME; ++MI) {
+    Value *BoolInt = MI->first.first;
+    Type *SelectTy = MI->first.second;
+    EVT VT = TLI->getValueType(MI->first.second);
+    if (!TLI->shouldIntroduceUIToFP(VT, MI->second.CanFormFMulLocs.size(),
+                                    MI->second.CanFormFMALocs.size()) &&
+        !FindExistingBoolToFloatCasts(BoolInt, SelectTy))
+      continue;
+
+    SelectUsageInfo *SUI = &MI->second;
+
+    Instruction *BoolFP = 0, *InvertBoolFP = 0;
+    if (SUI->HasWithoutInvert) {
+      BoolFP = new UIToFPInst(BoolInt, SelectTy);
+      if (Instruction *BoolInst = dyn_cast<Instruction>(BoolInt))
+        BoolFP->insertAfter(BoolInst);
+      else if (isa<Argument>(BoolInt))
+        BoolFP->insertBefore(F.getEntryBlock().getFirstInsertionPt());
+      else
+        assert(false && "condition is not an instruction or argument?");
+      if (SUI->HasWithInvert) {
+        Value *ConstantOne;
+        if (SelectTy->isVectorTy())
+          ConstantOne =
+            ConstantVector::getSplat(SelectTy->getVectorNumElements(),
+                                     ConstantFP::get(SelectTy->getScalarType(),
+                                                     1.0));
+        else
+          ConstantOne = ConstantFP::get(SelectTy, 1.0);
+        InvertBoolFP =
+          BinaryOperator::CreateFSub(ConstantOne, BoolFP);
+        InvertBoolFP->insertAfter(BoolFP);
+      }
+    } else if (SUI->HasWithInvert) {
+      Instruction *InvertBoolInst = BinaryOperator::CreateNot(BoolInt);
+      if (Instruction *BoolInst = dyn_cast<Instruction>(BoolInt))
+        InvertBoolInst->insertAfter(BoolInst);
+      else if (isa<Argument>(BoolInt))
+        InvertBoolInst->insertBefore(F.getEntryBlock().getFirstInsertionPt());
+      else
+        assert(false && "condition is not an instruction or argument?");
+      InvertBoolFP = new UIToFPInst(InvertBoolInst, SelectTy);
+      InvertBoolFP->insertAfter(InvertBoolInst);
+    }
+
+    Changed = true;
+    FindExistingBoolToFloatCasts(BoolInt, SelectTy, BoolFP, InvertBoolFP);
+    IRBuilder<> Builder(F.getContext());
+    for (unsigned i = 0, e = SUI->CanFormFMulLocs.size(); i != e; ++i) {
+      ReplaceWithFMul(Builder, SUI->CanFormFMulLocs[i],
+                      SUI->CanFormFMulKinds[i], BoolFP, InvertBoolFP);
+    }
+    for (unsigned i = 0, e = SUI->CanFormFMALocs.size(); i != e; ++i) {
+      ReplaceWithFMA(F.getParent(), Builder, SUI->CanFormFMALocs[i],
+                     SUI->CanFormFMAKinds[i], BoolFP, InvertBoolFP);
+    }
+  }
+
+  return Changed;
 }
 
 /// EliminateFallThrough - Merge basic blocks which are connected
