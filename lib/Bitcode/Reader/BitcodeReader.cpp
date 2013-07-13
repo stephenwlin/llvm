@@ -2252,6 +2252,21 @@ bool BitcodeReader::ParseFunctionBody(Function *F) {
 
       I = SelectInst::Create(Cond, TrueVal, FalseVal);
       InstructionList.push_back(I);
+      if (OpNum < Record.size() && isa<FPMathOperator>(I)) {
+        FastMathFlags FMF;
+        if (0 != (Record[OpNum] & FastMathFlags::UnsafeAlgebra))
+          FMF.setUnsafeAlgebra();
+        if (0 != (Record[OpNum] & FastMathFlags::NoNaNs))
+          FMF.setNoNaNs();
+        if (0 != (Record[OpNum] & FastMathFlags::NoInfs))
+          FMF.setNoInfs();
+        if (0 != (Record[OpNum] & FastMathFlags::NoSignedZeros))
+          FMF.setNoSignedZeros();
+        if (0 != (Record[OpNum] & FastMathFlags::AllowReciprocal))
+          FMF.setAllowReciprocal();
+        if (FMF.any())
+          I->setFastMathFlags(FMF);
+      }
       break;
     }
 

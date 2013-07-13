@@ -1169,12 +1169,16 @@ static void WriteInstruction(const Instruction &I, unsigned InstID,
       Vals.push_back(*i);
     break;
   }
-  case Instruction::Select:
+  case Instruction::Select: {
     Code = bitc::FUNC_CODE_INST_VSELECT;
     PushValueAndType(I.getOperand(1), InstID, Vals, VE);
     pushValue(I.getOperand(2), InstID, Vals, VE);
     PushValueAndType(I.getOperand(0), InstID, Vals, VE);
+    uint64_t Flags = GetOptimizationFlags(&I);
+    if (Flags != 0)
+      Vals.push_back(Flags);
     break;
+  }
   case Instruction::ExtractElement:
     Code = bitc::FUNC_CODE_INST_EXTRACTELT;
     PushValueAndType(I.getOperand(0), InstID, Vals, VE);

@@ -3266,12 +3266,12 @@ int LLParser::ParseInstruction(Instruction *&Inst, BasicBlock *BB,
   case lltok::kw_fdiv:
   case lltok::kw_frem: {
     FastMathFlags FMF = EatFastMathFlagsIfPresent();
-    int Res = ParseArithmetic(Inst, PFS, KeywordVal, 2);
-    if (Res != 0)
+    bool Res = ParseArithmetic(Inst, PFS, KeywordVal, 2);
+    if (Res)
       return Res;
     if (FMF.any())
       Inst->setFastMathFlags(FMF);
-    return 0;
+    return false;
   }
 
   case lltok::kw_sdiv:
@@ -3306,7 +3306,20 @@ int LLParser::ParseInstruction(Instruction *&Inst, BasicBlock *BB,
   case lltok::kw_inttoptr:
   case lltok::kw_ptrtoint:       return ParseCast(Inst, PFS, KeywordVal);
   // Other.
-  case lltok::kw_select:         return ParseSelect(Inst, PFS);
+  case lltok::kw_select: {
+    LocTy FlagLoc = Lex.getLoc();
+    FastMathFlags FMF = EatFastMathFlagsIfPresent();
+    bool Res = ParseSelect(Inst, PFS);
+    if (Res)
+      return Res;
+    if (FMF.any()) {
+      if (!Inst->getType()->isFPOrFPVectorTy())
+        return Error(FlagLoc, "unexpected fast-math flag on select without "
+                     "floating-point type");
+      Inst->setFastMathFlags(FMF);
+    }
+    return false;
+  }
   case lltok::kw_va_arg:         return ParseVA_Arg(Inst, PFS);
   case lltok::kw_extractelement: return ParseExtractElement(Inst, PFS);
   case lltok::kw_insertelement:  return ParseInsertElement(Inst, PFS);

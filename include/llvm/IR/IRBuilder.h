@@ -1314,7 +1314,11 @@ public:
       if (Constant *TC = dyn_cast<Constant>(True))
         if (Constant *FC = dyn_cast<Constant>(False))
           return Insert(Folder.CreateSelect(CC, TC, FC), Name);
-    return Insert(SelectInst::Create(C, True, False), Name);
+    SelectInst *SI = SelectInst::Create(C, True, False);
+    if (isa<FPMathOperator>(SI))
+      return Insert(AddFPMathAttributes(SI, FPMathTag, FMF), Name);
+    else
+      return Insert(SI, Name);
   }
 
   VAArgInst *CreateVAArg(Value *List, Type *Ty, const Twine &Name = "") {
