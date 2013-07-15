@@ -1316,7 +1316,7 @@ public:
           return Insert(Folder.CreateSelect(CC, TC, FC), Name);
     SelectInst *SI = SelectInst::Create(C, True, False);
     if (isa<FPMathOperator>(SI))
-      return Insert(AddFPMathAttributes(SI, FPMathTag, FMF), Name);
+      return Insert(AddFPMathAttributes(SI, 0, FMF), Name);
     else
       return Insert(SI, Name);
   }
