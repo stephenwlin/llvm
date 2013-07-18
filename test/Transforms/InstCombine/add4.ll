@@ -1,5 +1,7 @@
 ; RUN: opt < %s -instcombine -S | FileCheck %s
 
+declare void @usefloat(float)
+
 define float @test1(float %A, float %B, i1 %C) {
 EntryBlock:
   ;; A*(1 - uitofp i1 C) -> select C, 0, A
@@ -8,7 +10,7 @@ EntryBlock:
   %p1 = fmul fast float %A, %mc
   ret float %p1
 ; CHECK-LABEL: @test1(
-; CHECK: select i1 %C, float -0.000000e+00, float %A
+; CHECK: select i1 %C, float 0.000000e+00, float %A
 }
 
 define float @test2(float %A, float %B, i1 %C) {
@@ -16,9 +18,10 @@ EntryBlock:
   ;; B*(uitofp i1 C) -> select C, B, 0
   %cf = uitofp i1 %C to float
   %p2 = fmul fast float %B, %cf
+  call void @usefloat(float %cf)
   ret float %p2
 ; CHECK-LABEL: @test2(
-; CHECK: select i1 %C, float %B, float -0.000000e+00
+; CHECK: select i1 %C, float %B, float 0.000000e+00
 }
 
 define float @test3(float %A, float %B, i1 %C) {
@@ -41,6 +44,8 @@ EntryBlock:
   %p1 = fmul fast float %A, %mc
   %p2 = fmul fast float %B, %cf
   %s1 = fadd fast float %p2, %p1
+  call void @usefloat(float %cf)
+  call void @usefloat(float %mc)
   ret float %s1
 ; CHECK-LABEL: @test4(
 ; CHECK: select i1 %C, float %B, float %A
@@ -54,6 +59,8 @@ EntryBlock:
   %p1 = fmul fast float %A, %mc
   %p2 = fmul fast float %B, %cf
   %s1 = fadd fast float %p1, %p2
+  call void @usefloat(float %cf)
+  call void @usefloat(float %mc)
   ret float %s1
 ; CHECK-LABEL: @test5(
 ; CHECK: select i1 %C, float %B, float %A

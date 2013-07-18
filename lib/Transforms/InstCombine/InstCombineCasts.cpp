@@ -1327,10 +1327,61 @@ Instruction *InstCombiner::visitFPToSI(FPToSIInst &FI) {
 }
 
 Instruction *InstCombiner::visitUIToFP(CastInst &CI) {
+  Value *OpV = CI.getOperand(0);
+
+  // uitofp on i1 becomes a select
+  if (OpV->getType()->getScalarSizeInBits() == 1)
+    return SelectInst::Create(OpV, ConstantFP::get(CI.getType(), 1.0),
+                              ConstantFP::get(CI.getType(), 0.0));
+
+  Instruction *OpI = dyn_cast<Instruction>(OpV);
+  if (!OpI)
+    return commonCastTransforms(CI);
+
+  if (isa<ZExtInst>(OpI)) {
+    if (OpI->getOperand(0)->getType()->getScalarSizeInBits() == 1)
+      return SelectInst::Create(OpI->getOperand(0),
+                                ConstantFP::get(CI.getType(), 1.0),
+                                ConstantFP::get(CI.getType(), 0.0));
+    else
+      return new UIToFPInst(OpI->getOperand(0), CI.getType());
+  }
+
   return commonCastTransforms(CI);
 }
 
 Instruction *InstCombiner::visitSIToFP(CastInst &CI) {
+  Value *OpV = CI.getOperand(0);
+
+  // sitofp on i1 becomes a select
+  if (OpV->getType()->getScalarSizeInBits() == 1)
+    return SelectInst::Create(OpV, ConstantFP::get(CI.getType(), -1.0),
+                              ConstantFP::get(CI.getType(), 0.0));
+
+  Instruction *OpI = dyn_cast<Instruction>(OpV);
+  if (!OpI)
+    return commonCastTransforms(CI);
+
+  // sitofp(zext(X)) --> uitofp(X)
+  if (isa<ZExtInst>(OpI)) {
+    if (OpI->getOperand(0)->getType()->getScalarSizeInBits() == 1)
+      return SelectInst::Create(OpI->getOperand(0),
+                                ConstantFP::get(CI.getType(), 1.0),
+                                ConstantFP::get(CI.getType(), 0.0));
+    else
+      return new UIToFPInst(OpI->getOperand(0), CI.getType());
+  }
+
+  // sitofp(sext(X)) --> sitofp(X)
+  if (isa<SExtInst>(OpI)) {
+    if (OpI->getOperand(0)->getType()->getScalarSizeInBits() == 1)
+      return SelectInst::Create(OpI->getOperand(0),
+                                ConstantFP::get(CI.getType(), -1.0),
+                                ConstantFP::get(CI.getType(), 0.0));
+    else
+      return new SIToFPInst(OpI->getOperand(0), CI.getType());
+  }
+
   return commonCastTransforms(CI);
 }
 

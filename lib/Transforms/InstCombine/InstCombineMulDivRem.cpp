@@ -556,31 +556,42 @@ Instruction *InstCombiner::visitFMul(BinaryOperator &I) {
       }
     }
 
-    // B * (uitofp i1 C) -> select C, B, 0
+    // B * (select C 1.0 0.0) -> select C, B, 0.0
+    // A * (select C 0.0 1.0) -> select C, 0.0, A
+    // B * (1.0 - (select C 0.0 1.0)) -> select C, B, 0.0
+    // A * (1.0 - (select C 1.0 0.0)) -> select C, 0.0, A
     if (I.hasNoNaNs() && I.hasNoInfs() && I.hasNoSignedZeros()) {
-      Value *LHS = Op0, *RHS = Op1;
-      Value *B, *C;
-      if (!match(RHS, m_UIToFP(m_Value(C))))
-        std::swap(LHS, RHS);
+      Value *C;
 
-      if (match(RHS, m_UIToFP(m_Value(C))) && C->getType()->isIntegerTy(1)) {
-        B = LHS;
-        Value *Zero = ConstantFP::getNegativeZero(B->getType());
+      if (match(Opnd1, m_Select(m_Value(C), m_FPOne(), m_AnyZero())) &&
+          C->getType()->isIntegerTy(1)) {
+        Value *B = Opnd0;
+        Value *Zero = Constant::getNullValue(B->getType());
         return SelectInst::Create(C, B, Zero);
       }
-    }
 
-    // A * (1 - uitofp i1 C) -> select C, 0, A
-    if (I.hasNoNaNs() && I.hasNoInfs() && I.hasNoSignedZeros()) {
-      Value *LHS = Op0, *RHS = Op1;
-      Value *A, *C;
-      if (!match(RHS, m_FSub(m_FPOne(), m_UIToFP(m_Value(C)))))
-        std::swap(LHS, RHS);
-
-      if (match(RHS, m_FSub(m_FPOne(), m_UIToFP(m_Value(C)))) &&
+      if (match(Opnd1, m_Select(m_Value(C), m_AnyZero(), m_FPOne())) &&
           C->getType()->isIntegerTy(1)) {
-        A = LHS;
-        Value *Zero = ConstantFP::getNegativeZero(A->getType());
+        Value *A = Opnd0;
+        Value *Zero = Constant::getNullValue(A->getType());
+        return SelectInst::Create(C, Zero, A);
+      }
+
+      // The one-minus pattern matches are necessary because the pattern is
+      // only folded by FoldOpIntoSelect when the select has only one use
+      if (match(Opnd1, m_FSub(m_FPOne(),
+                              m_Select(m_Value(C), m_AnyZero(), m_FPOne()))) &&
+          C->getType()->isIntegerTy(1)) {
+        Value *B = Opnd0;
+        Value *Zero = Constant::getNullValue(B->getType());
+        return SelectInst::Create(C, B, Zero);
+      }
+
+      if (match(Opnd1, m_FSub(m_FPOne(),
+                              m_Select(m_Value(C), m_FPOne(), m_AnyZero()))) &&
+          C->getType()->isIntegerTy(1)) {
+        Value *A = Opnd0;
+        Value *Zero = Constant::getNullValue(A->getType());
         return SelectInst::Create(C, Zero, A);
       }
     }
